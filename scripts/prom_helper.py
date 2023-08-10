@@ -2,20 +2,12 @@
 
 import argparse
 import datetime
-import functools
 import requests
-import re
-import subprocess
-import shlex
-import sys
-import time
-import string
-import random
 import urllib.parse
-import pymysql
 import json
-import awswrangler as wr
-import pandas as pd
+import awswrangler  as wr
+import pandas  as pd
+import os
 
 dry_run = False
 verbose = False
@@ -26,6 +18,7 @@ S3KEY_RAW_DATASET = os.getenv("S3KEY_RAW_DATASET")
 S3KEY_TRUSTED_DATASET = os.getenv("S3KEY_TRUSTED_DATASET")
 ATHENA_DB = os.getenv("ATHENA_DB", "default")
 ATHENA_TABLE = os.getenv("ATHENA_TABLE")
+SG_LABELS = os.getenv("ATHENA_TABLE")
 
 METRICS = [
     "scylla_manager_repair_progress",
@@ -76,15 +69,6 @@ def trace_verbose(*arg):
     if verbose:
         print(*arg)
 
-def run(cmd, shell=False):
-    if dry_run:
-        return
-    trace_verbose(cmd)
-    if not shell:
-        cmd = shlex.split(cmd)
-    out =  subprocess.check_output(cmd, shell=shell).decode(sys.stdout.encoding)
-    trace_verbose(out)
-    return out
 
 def get(url, params):
     trace_verbose(url)
@@ -114,14 +98,14 @@ def print_federate_res(args, res):
     else:
         print(res) 
 
-def get_connection(args):
-    host = 'scylla-downloads-v2.cluster-cmibwi2oeyz8.us-west-2.rds.amazonaws.com'
-    user = args.username
-    password = args.password
-    database = args.database
-    if verbose:
-        print("connect", host, user, password, database)
-    return pymysql.connect(host=host, user=user, password=password, database=database)
+# def get_connection(args):
+#     host = 'scylla-downloads-v2.cluster-cmibwi2oeyz8.us-west-2.rds.amazonaws.com'
+#     user = args.username
+#     password = args.password
+#     database = args.database
+#     if verbose:
+#         print("connect", host, user, password, database)
+#     return pymysql.connect(host=host, user=user, password=password, database=database)
 
 def store(args, res):
     host = 'admin.cjp8hsqu4je0.us-east-2.rds.amazonaws.com'
@@ -159,48 +143,25 @@ def should_filter(filters, line):
                 return True 
     return False
 
-def create_table(args):
-    print(make_query("""
-CREATE TABLE  {DATABASE_NAME}.{TABLE_NAME} (
-    cluster_id BIGINT NOT NULL,
-    time TIMESTAMP NOT NULL,
-    {COLUMNS},
-    CONSTRAINT PK_clusterinfo PRIMARY KEY (cluster_id, time)
-);    
-""",{"COLUMNS": ",\n".join([m +" BIGINT" for m in METRICS])}))
-
-def drop_table(args):
-    print(make_query("""
-DROP TABLE {DATABASE_NAME}.{TABLE_NAME};
-"""))
-
-def truncate_table(args):
-    print(make_query("""
-TRUNCATE TABLE {DATABASE_NAME}.{TABLE_NAME};
-"""))
-
-def rds_insert(args, records):
-    connection = get_connection(args)
-    with connection:
-        with connection.cursor() as cursor:
-            # Create a new record
-            for c in records:
-                sql = make_query("INSERT INTO {DATABASE_NAME}.{TABLE_NAME} (cluster_id, time, {COLUMNS}) VALUES (%s, %s, {COLUMNS_S})",{'COLUMNS' : ",".join(METRICS),
-                                                                                                              'COLUMNS_S': ','.join(['%s' for m in METRICS])})
-                cluster = records[c]
-                dt = datetime.datetime.fromtimestamp(cluster['__time']/1000)
-                params = [c, dt] + [cluster[m] if m in cluster else None for m in METRICS]
-                cursor.execute(sql, params)
-        connection.commit()
-
 def s3_insert(args, record):
+    result = []
+    for c in records:
+        result.append(records[c])
     
+    df = pd.DataFrame(result)
+    df['__time'] = df['__time'] / 1000
+    df['partition'] = datetime.datetime.now().strftime('%Y%m%d')
+
+    wr.s3.to_parquet(path='s3://scylla-cloud-reports-297607762119-eu-central-1/test/cluster_metrics', database='default', table='test_metrics', partition_cols=['partition'], df=df, dataset=True)
+
+    df['partition'] = 'latest'
+    wr.s3.to_parquet(path='s3://scylla-cloud-reports-297607762119-eu-central-1/test/cluster_metrics', database='default', table='test_metrics_latest', df=df, dataset=True)
+
 def print_insert(args, records):
     for c in records:
-        cluster = records[c]
-        dt = datetime.datetime.fromtimestamp(cluster['__time']/1000)
-        params = [c, dt] + [cluster[m] if m in cluster else None for m in METRICS]
-        print(params)
+        metrics = records[c]
+        print(metrics)
+
 
 def insert(args, record):
     if args.insert == 'print':
@@ -229,13 +190,15 @@ def get_table(args):
         print(json.dumps(results[args.limit:], indent=2))
     else:
         print(json.dumps(results, indent=2))
+def get_name(p, args):
+    suf = "_".join([p[k[0]] for k in args.labels if k[0] in p and (len(k) < 2 or k[1] in p['name'])])
+    return p['name'] + '_' + suf if suf else p['name'] 
 
 def read_federate(args):
     url = "http://" + args.host + ":9090/federate"
     par = ",".join(args.match)
     param = urllib.parse.quote("{" + par + "}")
     url = url + "?match[]=" + param
-    # {'match[]': param}
     lines = get(url, {}).splitlines()
     res = [parse(l.decode('ascii')) for l in lines]
     results = {}
@@ -248,8 +211,8 @@ def read_federate(args):
         if 'cluster' in p:
             c = int(p['cluster'][1:])
             if c not in results:
-                results[c] = {}
-            n = p['name']
+                results[c] = {'cluster_id':c}
+            n = get_name(p, args)
             if n in results[c]:
                 results[c][n] += p['__value']
             else:
@@ -262,53 +225,35 @@ def read_federate(args):
     insert(args, results)  
     trace_verbose("total results", len(results))
     
+    
 def update_args(args):
     if not args.host or args.host == "":
         try:
             args.__dict__['host'] = run('./scripts/find_ip.sh aprom').strip(' \t\n\r')
         except:
             print("find_ip not found")
+    args.__dict__['labels'] = [ k.split(',') for k in args.labels]
     return args
 
-def help(args):
-    parser.print_help()
-
-def do_rds(args):
-    if args.command == "drop":
-        drop_table(args)
-    if args.command == 'truncate':
-        truncate_table(args)
-    elif args.command == "create":
-        create_table(args)
-    elif args.command == "get":
-        get_table(args)
-
 parser = argparse.ArgumentParser(description='Prometheus helper tool', conflict_handler="resolve")
-parser.add_argument('-H', '--host', help='A Prometheus server to connect to')
+parser.add_argument('-H', '--host', default="127.0.0.1", help='A Prometheus server to connect to')
 parser.add_argument('-V', '--verbose', default=False, help="when set, run in verbose mode", action='store_true')
 parser.add_argument('-U', '--username', help="Database User name")
 parser.add_argument('-P', '--password', help="Database User name")
 parser.add_argument('-D', '--database', help="Database User name")
+parser.add_argument('-M', '--match', action='append', help="Matchers to look for. Use key=value, for example 'by=\"cluster\"'", default=['by="cluster"'])
+parser.add_argument('-F', '--filter', action='append', help="Filter the results based on label, use label=cmd,val. cmp=[eq - equal label must exists. miseq - label is missing, or is equal. drop - drop if label exists]")
+parser.add_argument('-C', '--coloumns', action='append', help="Show only a few coloumn")
+parser.add_argument('-L', '--labels', action='append', default = ['scheduling_group_name,latency'], help="if those label exists add them to the name")
+parser.add_argument('-I', '--insert', default="print", choices=['print', 'rds', 's3'], help="how to insert the data")
 
-subparsers = parser.add_subparsers(help='Available commands')
-parser_help = subparsers.add_parser('help', help='Display help information')
-parser_help.set_defaults(func=help)
-
-parser_federate = subparsers.add_parser('federate', help='Query a prometheus server using the federate API')
-parser_federate.set_defaults(func=read_federate)
-
-parser_federate.add_argument('-M', '--match', action='append', help="Matchers to look for. Use key=value, for example 'by=\"cluster\"'")
-parser_federate.add_argument('-F', '--filter', action='append', help="Filter the results based on label, use label=cmd,val. cmp=[eq - equal label must exists. miseq - label is missing, or is equal. drop - drop if label exists]")
-parser_federate.add_argument('-C', '--coloumns', action='append', help="Show only a few coloumn")
-parser_federate.add_argument('-I', '--insert', default="print", choices=['print', 'rds', 's3'], help="how to insert the data")
-
-parser_rds = subparsers.add_parser('rds', help='perform an RDS command')
-parser_rds.add_argument('-l', '--limit', type=int, help="limit the number of printed results")
-parser_rds.add_argument('command', help='the rds command to perform, create - create a table, drop - drop the table, get - read from the table, truncate - truncate a table')
-parser_rds.set_defaults(func=do_rds)
+# parser_rds = subparsers.add_parser('rds', help='perform an RDS command')
+# parser_rds.add_argument('-l', '--limit', type=int, help="limit the number of printed results")
+# parser_rds.add_argument('command', help='the rds command to perform, create - create a table, drop - drop the table, get - read from the table, truncate - truncate a table')
+# parser_rds.set_defaults(func=do_rds)
 args = parser.parse_args()
 if args.verbose:
     verbose = True
 update_args(args)
-args.func(args)
+read_federate(args)
 
