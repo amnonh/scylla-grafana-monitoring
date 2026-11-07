@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -732,11 +733,12 @@ def option(argv, opt, default=None):
 class Stack:
     """Runs the actions against the stack in the monitoring directory."""
 
-    def __init__(self, dirs, args, run=subprocess.run, http=None, sleep=time.sleep):
+    def __init__(self, dirs, args, run=subprocess.run, http=None, sleep=time.sleep, listening=None):
         self.dirs = dirs
         self.args = args
         self.run = run
         self.http = http or http_status
+        self.listening = listening or port_listening
         self.sleep = sleep
         self.compose = getattr(args, "compose", False)
         self.compose_build = None  # make_compose.build, set on first use; tests replace it
@@ -1024,6 +1026,18 @@ def http_status(method, url):
         return None
 
 
+def port_listening(host, port):
+    """Whether host:port takes a connection. Only a refused one counts: a
+    busy service that is slow to answer is listening."""
+    try:
+        socket.create_connection((host, int(port)), timeout=5).close()
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
 def applied_path(dirs):
     return os.path.join(dirs.state, "applied.yaml")
 
@@ -1120,6 +1134,12 @@ def apply_once(args, stack=None, run=subprocess.run, path=None):
         return rejected(dirs, e)
     previous = yaml.safe_load(applied_text) if applied_text else None
     old = None if force else previous
+    # Only a full apply starts a container that went down (one that crashed),
+    # as on the watcher's start: without it, a file whose changes start
+    # nothing fails the health check and is reverted.
+    if old is not None and container_down(dirs, stack):
+        print("a component is down: applying the whole file", file=sys.stderr)
+        old = None
     ran_traefik = traefik_may_run(dirs) or tls_on(previous) or tls_on(new)
     try:
         actions = stack.apply(old, new, argv, env, previous, ran_traefik=traefik_may_run(dirs),
@@ -1153,6 +1173,24 @@ def signature(path):
     except FileNotFoundError:
         return None
     return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def container_down(dirs, stack):
+    """Whether a component of the applied file's stack refuses connections on
+    its port, as when its container exited (it crashed). A component that is
+    starting or busy takes the connection, so it is not restarted for it."""
+    applied = read_applied(dirs)
+    if applied is None:
+        return False
+    try:
+        cfg = yaml.safe_load(applied)
+        argv, _ = normalize(cfg, dirs)
+        ports = [(stack.host(argv), port) for _, port, _ in stack.components(argv)]
+    except (ApplyError, ConfigError, yaml.YAMLError):
+        return True
+    if tls_on(cfg):
+        ports.append(("localhost", "8080"))  # traefik's ping
+    return not all(stack.listening(host, port) for host, port in ports)
 
 
 def stack_up(dirs, stack):

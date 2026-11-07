@@ -492,7 +492,7 @@ def make_stack(tmp, host):
                            cert_dir="/certs", root_helper="/helper", health_timeout=0, config_file=[], state_dir=None)
     dirs = smc.make_dirs(args)
     http = lambda method, url: 200
-    return args, smc.Stack(dirs, args, host.run, http, sleep=lambda s: None)
+    return args, smc.Stack(dirs, args, host.run, http, sleep=lambda s: None, listening=lambda h, port: True)
 
 
 def apply(args, stack, host, cfg):
@@ -751,6 +751,82 @@ def test_apply_compose():
         assert apply(args, stack, host, cfg) == 0
         assert names(host) == ["prometheus-config.sh -m", "grafana-datasource.sh", "docker compose"]
         assert "--traefik" not in builds[-1][0]
+
+
+def test_full_apply_when_down():
+    """A container that went down, whose port refuses connections, is started
+    by applying the file whole, also when the file's changes start nothing,
+    in start-all.sh and in compose mode. A component that takes connections
+    is up, however slow; a forced apply and a rejected file are not checked."""
+    import make_compose
+    for compose in (False, True):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = FakeHost()
+            args, stack = make_stack(tmp, host)
+            args.auto_revert = True
+            if compose:
+                stack.compose = True
+
+                def build(argv, environ, cwd):
+                    result = make_compose.Stack()
+                    result.compose = {"services": {}}
+                    result.commands = [["./prometheus-config.sh", "-m", "aalert:9093"]]
+                    return result
+                stack.compose_build = build
+            cfg = example()
+            assert apply(args, stack, host, cfg) == 0
+            restart = "docker compose" if compose else "start-all.sh -v"
+            ports = []
+
+            # Grafana crashed: its port refuses connections, and it is not
+            # ready, until the stack restarts
+            def listening(h, port):
+                ports.append((h, port))
+                return port != "3000" or restart in names(host)
+
+            def health(argv, c, timeout=None):
+                if restart not in names(host):
+                    raise smc.ApplyError("grafana: not ready")
+            stack.listening, stack.health = listening, health
+            host.commands.clear()
+            cfg["generation"] = "g2"
+            assert apply(args, stack, host, cfg) == 0
+            status = json.load(open(os.path.join(tmp, "config-state/status.json")))
+            assert status["state"] == "applied" and status["generation"] == "g2"
+            assert yaml.safe_load(open(os.path.join(tmp, "config-state/applied.yaml")))["generation"] == "g2"
+            assert ("127.0.0.1", "3000") in ports
+            assert "kill-all.sh --traefik" in names(host) and restart in names(host)
+            # every port takes connections: the same change starts nothing
+            stack.listening = lambda h, port: ports.append(port) or True
+            stack.health = lambda argv, c, timeout=None: None
+            ports.clear()
+            host.commands.clear()
+            cfg["generation"] = "g3"
+            assert apply(args, stack, host, cfg) == 0
+            # with TLS, traefik's port too
+            assert set(ports) == {"9090", "3000", "9093", "3100", "8080"} and "kill-all.sh --traefik" not in names(host)
+            # a forced apply runs everything anyway, and a rejected file runs nothing
+            ports.clear()
+            args.force = True
+            cfg["generation"] = "g4"
+            assert apply(args, stack, host, cfg) == 0 and ports == []
+            args.force = False
+            cfg["generation"] = "g5"
+            cfg["tls"]["listen_ip"] = ""
+            assert apply(args, stack, host, cfg) == 1 and ports == []
+            assert json.load(open(os.path.join(tmp, "config-state/status.json")))["state"] == "rejected"
+
+
+def test_port_listening():
+    """Only a refused connection is a port nobody listens on."""
+    import socket
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    assert smc.port_listening("127.0.0.1", port)
+    server.close()
+    assert not smc.port_listening("127.0.0.1", port)
 
 
 def test_stack_flags():
